@@ -41,6 +41,8 @@ def command_line():
     parser.add_argument('-threads', type=int, default=4,
                         help='Parallel threads. 0 means use all available CPU threads. '
                              'Do not use multithread if you are short in memory')
+    parser.add_argument('-weighted_only', action='store_true', default=False,
+                        help='If Information Accretion is provided, skip unweighted metric computation')
     parser.add_argument('-log_level', type=str, choices=['debug', 'info', 'warning', 'error', 'critical'],
                         default='info', help='Log level')
 
@@ -58,7 +60,8 @@ def command_line():
     df, dfs_best = cafa_eval(args.obo_file, args.pred_dir, args.gt_file,
                              ia=args.ia, no_orphans=args.no_orphans, norm=args.norm, prop=args.prop,
                              exclude=args.known, toi_file=args.toi,
-                             max_terms=args.max_terms, th_step=args.th_step, n_cpu=args.threads)
+                             max_terms=args.max_terms, th_step=args.th_step, n_cpu=args.threads,
+                             weighted_only=args.weighted_only)
 
     # Write the results
     write_results(df, dfs_best, out_dir=args.out_dir, th_step=args.th_step)

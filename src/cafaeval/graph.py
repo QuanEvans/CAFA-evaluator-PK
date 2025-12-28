@@ -59,6 +59,12 @@ class Graph:
         self.top_sort()
         logging.debug("order sorted {}".format(self.order))
 
+        # Cache children indexes for faster propagation
+        self.children_idx = [
+            np.array(sorted(term['children']), dtype='int32') if term['children'] else np.array([], dtype='int32')
+            for term in self.terms_list
+        ]
+
         if orphans:
             self.toi = np.arange(self.dag.shape[0])  # All terms, also those without parents
         else:
@@ -163,7 +169,7 @@ def propagate(matrix, ont, order, mode='max'):
 
     for i in order_:
         # Get direct children
-        children = np.where(ont.dag[:, i] != 0)[0]
+        children = ont.children_idx[i]
         if children.size > 0:
             # Add current terms to children
             cols = np.concatenate((children, [i]))
@@ -176,7 +182,6 @@ def propagate(matrix, ont, order, mode='max'):
                     idx = np.ix_(rows, cols)
                     matrix[rows, i] = matrix[idx].max(axis=1)
     return
-
 
 
 

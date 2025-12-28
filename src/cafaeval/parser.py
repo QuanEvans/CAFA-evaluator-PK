@@ -187,9 +187,11 @@ def pred_parser(pred_file, ontologies, gts, prop_mode, max_terms=None):
     matrix = {}
     ns_dict = {}  # {namespace: term}
     replaced = {}
+    row_counts = {}
     for ns in gts:
         matrix[ns] = np.zeros(gts[ns].matrix.shape, dtype='float')
         ids[ns] = {}
+        row_counts[ns] = np.zeros(matrix[ns].shape[0], dtype='int32')
         for term in ontologies[ns].terms_dict:
             ns_dict[term] = ns
         for term in ontologies[ns].terms_dict_alt:
@@ -211,10 +213,14 @@ def pred_parser(pred_file, ontologies, gts, prop_mode, max_terms=None):
                         replaced.setdefault(ns, 0)
                         replaced[ns] += len(term_ids)
                     for term_id in term_ids:
-                        if max_terms is None or np.count_nonzero(matrix[ns][i]) <= max_terms:
-                            j = ontologies[ns].terms_dict.get(term_id)['index']
-                            ids[ns][p_id] = i
-                            matrix[ns][i, j] = max(matrix[ns][i, j], float(prob))
+                        j = ontologies[ns].terms_dict.get(term_id)['index']
+                        current_score = matrix[ns][i, j]
+                        if max_terms is not None and current_score == 0:
+                            if row_counts[ns][i] >= max_terms:
+                                continue
+                            row_counts[ns][i] += 1
+                        ids[ns][p_id] = i
+                        matrix[ns][i, j] = max(current_score, float(prob))
 
     predictions = {}
     for ns in ids:
