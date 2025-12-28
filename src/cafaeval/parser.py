@@ -158,12 +158,13 @@ def gt_parser(gt_file, ontologies):
     return gts
 
 
-def gt_exclude_parser(exclude_file, gt, ontologies):
+def gt_exclude_parser(exclude_file, gt, ontologies, exclude_gt=None):
     """
     Process terms that should be excluded from evaluation.
     """
     # Propagate exclude terms and parse alternative IDs
-    exclude_gt = gt_parser(exclude_file, ontologies)
+    if exclude_gt is None:
+        exclude_gt = gt_parser(exclude_file, ontologies)
 
     # reindex exclusion matrices to match ground truth
     exclude = {}

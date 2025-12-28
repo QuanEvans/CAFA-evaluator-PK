@@ -1,5 +1,6 @@
 src/__pycache__/
 src/cafaeval/__pycache__/
+.cache/
 eval/
 process_df.ipynb
 ia.ipynb
@@ -9,4 +10,3 @@ harmonic_mean.ipynb
 /.venv/
 /dist/
 src/.ipynb_checkpoints
-

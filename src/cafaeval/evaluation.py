@@ -2,11 +2,18 @@ import os
 import numpy as np
 import pandas as pd
 import multiprocessing as mp
+import concurrent.futures
+import hashlib
+import json
 from dataclasses import dataclass
+from cafaeval.graph import GroundTruth
 from cafaeval.parser import obo_parser, gt_parser, pred_parser, gt_exclude_parser, update_toi
 from cafaeval.tests import test_norm_metric, test_intersection
 import logging
 logging.getLogger(__name__).addHandler(logging.NullHandler())
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+CACHE_DIR = os.path.join(REPO_ROOT, '.cache')
 
 
 # Return a mask for all the predictions (matrix) >= tau
@@ -121,6 +128,97 @@ def compute_confusion_matrix_exclude(tau_arr, g_perprotein, pred_matrix, toi_per
 
     print("metrics calculated")
     return metrics
+
+
+def _ensure_cache_dir():
+    if not os.path.isdir(CACHE_DIR):
+        os.makedirs(CACHE_DIR, exist_ok=True)
+
+
+def _file_md5(path):
+    hash_md5 = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
+
+
+def _normalize_cache_options(options):
+    normalized = {}
+    for key, value in options.items():
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            normalized[key] = value
+        else:
+            normalized[key] = str(value)
+    return normalized
+
+
+def _cache_path(prefix, file_hash, options):
+    payload = {'file_hash': file_hash, 'options': _normalize_cache_options(options)}
+    digest = hashlib.md5(json.dumps(payload, sort_keys=True).encode('utf-8')).hexdigest()
+    return os.path.join(CACHE_DIR, f"{prefix}_{digest}.npz")
+
+
+def _serialize_ground_truth_cache(gt_dict, cache_file):
+    data = {}
+    namespaces = []
+    for ns, gt in gt_dict.items():
+        namespaces.append(ns)
+        rows, cols = gt.matrix.nonzero()
+        data[f'{ns}_rows'] = rows.astype(np.int32)
+        data[f'{ns}_cols'] = cols.astype(np.int32)
+        data[f'{ns}_shape'] = np.array(gt.matrix.shape, dtype=np.int32)
+        protein_ids = [''] * gt.matrix.shape[0]
+        for pid, idx in gt.ids.items():
+            protein_ids[idx] = pid
+        max_len = max((len(pid) for pid in protein_ids), default=1)
+        data[f'{ns}_proteins'] = np.array(protein_ids, dtype=f'<U{max_len}')
+    data['meta'] = np.array([json.dumps({'namespaces': namespaces})])
+    np.savez_compressed(cache_file, **data)
+
+
+def _deserialize_ground_truth_cache(cache_file):
+    gt = {}
+    with np.load(cache_file, allow_pickle=False) as cached:
+        metadata = json.loads(str(cached['meta'][0]))
+        for ns in metadata['namespaces']:
+            rows_key = f'{ns}_rows'
+            if rows_key not in cached:
+                continue
+            rows = cached[rows_key]
+            cols = cached[f'{ns}_cols']
+            shape = tuple(int(x) for x in cached[f'{ns}_shape'])
+            proteins = cached[f'{ns}_proteins'].tolist()
+            matrix = np.zeros(shape, dtype=bool)
+            matrix[rows, cols] = True
+            ids = {pid: idx for idx, pid in enumerate(proteins)}
+            gt[ns] = GroundTruth(ids, matrix, ns)
+    return gt
+
+
+def _collect_cache_options(obo_file, ia, no_orphans, norm, exclude, toi_file, th_step, n_cpu, weighted_only):
+    options = {
+        'obo_md5': _file_md5(obo_file),
+        'no_orphans': no_orphans,
+        'toi_path': os.path.abspath(toi_file) if toi_file else None,
+        'toi_md5': _file_md5(toi_file) if toi_file else None,
+        'cache_version': 'v1'
+    }
+    return options
+
+
+def _load_ground_truth_cached(tsv_path, ontologies, prefix, options):
+    file_hash = _file_md5(tsv_path)
+    cache_file = _cache_path(prefix, file_hash, options)
+    if os.path.isfile(cache_file):
+        logging.info("Loaded cached %s data from %s", prefix, cache_file)
+        return _deserialize_ground_truth_cache(cache_file)
+
+    gt = gt_parser(tsv_path, ontologies)
+    _ensure_cache_dir()
+    _serialize_ground_truth_cache(gt, cache_file)
+    logging.info("Cached %s data at %s", prefix, cache_file)
+    return gt
 
 
 @dataclass
@@ -397,10 +495,13 @@ def cafa_eval(obo_file, pred_dir, gt_file, ia=None, no_orphans=False, norm='cafa
     if weighted_only and ia is None:
         raise ValueError("Weighted-only evaluation requires an Information Accretion file")
 
-    # Parse ground truth file
-    gt = gt_parser(gt_file, ontologies)
+    cache_options = _collect_cache_options(obo_file, ia, no_orphans, norm, exclude, toi_file, th_step, n_cpu, weighted_only)
+
+    # Parse ground truth file with caching
+    gt = _load_ground_truth_cached(gt_file, ontologies, 'gt', cache_options)
     if exclude is not None:
-        gt_exclude = gt_exclude_parser(exclude, gt, ontologies)
+        exclude_gt = _load_ground_truth_cached(exclude, ontologies, 'known', cache_options)
+        gt_exclude = gt_exclude_parser(exclude, gt, ontologies, exclude_gt=exclude_gt)
     else:
         gt_exclude = None
 
@@ -412,19 +513,37 @@ def cafa_eval(obo_file, pred_dir, gt_file, ia=None, no_orphans=False, norm='cafa
             pred_files.append(os.path.join(root, file))
     logging.debug("Prediction paths {}".format(pred_files))
 
-    # Parse prediction files and perform evaluation
-    dfs = []
-    for file_name in pred_files:
+    total_cpus = mp.cpu_count()
+    eval_threads = n_cpu if n_cpu > 0 else total_cpus
+    eval_threads = max(1, min(eval_threads, total_cpus))
+    max_parallel = max(1, total_cpus // eval_threads)
+
+    def process_prediction(file_name):
         print(file_name)
         prediction = pred_parser(file_name, ontologies, gt, prop, max_terms)
         if not prediction:
             logging.warning("Prediction: {}, not evaluated".format(file_name))
-        else:
-            df_pred = evaluate_prediction(prediction, gt, ontologies, tau_arr, gt_exclude,
-                                          normalization=norm, n_cpu=n_cpu, weighted_only=weighted_only)
-            df_pred['filename'] = file_name.replace(pred_folder, '').replace('/', '_')
-            dfs.append(df_pred)
-            logging.info("Prediction: {}, evaluated".format(file_name))
+            return None
+        df_pred = evaluate_prediction(prediction, gt, ontologies, tau_arr, gt_exclude,
+                                      normalization=norm, n_cpu=eval_threads, weighted_only=weighted_only)
+        df_pred['filename'] = file_name.replace(pred_folder, '').replace('/', '_')
+        logging.info("Prediction: {}, evaluated".format(file_name))
+        return df_pred
+
+    dfs = []
+    if len(pred_files) > 1 and max_parallel > 1:
+        logging.info("Evaluating %d predictions in parallel batches of %d threads each", len(pred_files), eval_threads)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel) as executor:
+            future_to_file = {executor.submit(process_prediction, file_name): file_name for file_name in pred_files}
+            for future in concurrent.futures.as_completed(future_to_file):
+                result = future.result()
+                if result is not None:
+                    dfs.append(result)
+    else:
+        for file_name in pred_files:
+            result = process_prediction(file_name)
+            if result is not None:
+                dfs.append(result)
 
     # Concatenate all dataframes and save them
     df = None
